@@ -1,0 +1,8 @@
+PyQt5==5.15.11
+PyQtWebEngine==5.15.7
+python-dotenv==1.0.1
+langchain==0.3.27
+langchain-openai==0.3.28
+langgraph==0.2.74
+edge-tts==7.2.3
+pygame==2.6.1

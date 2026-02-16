@@ -1,0 +1,537 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live2D Desktop Pet</title>
+  <style>
+    html, body, #stage {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      background: transparent;
+      overflow: hidden;
+    }
+    #status {
+      position: fixed;
+      left: 10px;
+      top: 10px;
+      z-index: 10;
+      font: 14px/1.4 "Segoe UI", sans-serif;
+      color: #222;
+      background: rgba(255, 255, 255, 0.85);
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 6px 10px;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Live2D 正在加载...</div>
+  <div id="stage"></div>
+
+  <script>
+    async function loadScript(url) {
+      return new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = url;
+        s.async = false;
+        s.onload = () => resolve(url);
+        s.onerror = () => reject(new Error(`script load failed: ${url}`));
+        document.head.appendChild(s);
+      });
+    }
+
+    async function loadFirstAvailable(urls, label) {
+      let lastErr = null;
+      for (const url of urls) {
+        try {
+          console.log(`[ScriptLoader] try ${label}:`, url);
+          await loadScript(url);
+          console.log(`[ScriptLoader] ok ${label}:`, url);
+          return url;
+        } catch (e) {
+          lastErr = e;
+          console.warn(`[ScriptLoader] fail ${label}:`, url, e);
+        }
+      }
+      throw lastErr || new Error(`no available source for ${label}`);
+    }
+
+    async function ensureLive2DRuntime() {
+      await loadFirstAvailable(
+        [
+          "https://unpkg.com/pixi.js@6.5.10/dist/browser/pixi.min.js",
+          "https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js"
+        ],
+        "pixi"
+      );
+
+      // Cubism Core is required before cubism4.min.js.
+      await loadFirstAvailable(
+        [
+          "./vendor/live2dcubismcore.min.js",
+          "https://unpkg.com/live2dcubismcore@4.2.0/live2dcubismcore.min.js",
+          "https://cdn.jsdelivr.net/npm/live2dcubismcore@4.2.0/live2dcubismcore.min.js"
+        ],
+        "live2dcubismcore"
+      );
+
+      // Only load Cubism4 adapter. Do NOT load index.min.js to avoid Cubism2 runtime checks.
+      await loadFirstAvailable(
+        [
+          "https://unpkg.com/pixi-live2d-display@0.4.0/dist/cubism4.min.js",
+          "https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"
+        ],
+        "pixi-live2d-display-cubism4"
+      );
+    }
+
+    const STABLE_MODE = true;
+
+    async function buildPatchedModelUrl(modelUrl) {
+      const resp = await fetch(modelUrl, { cache: "no-store" });
+      if (!resp.ok) {
+        throw new Error(`读取模型文件失败: ${resp.status} ${resp.statusText}`);
+      }
+      const modelJson = await resp.json();
+      const refs = modelJson.FileReferences || {};
+
+      const toAbs = (p) => {
+        if (!p || typeof p !== "string") return p;
+        try {
+          return new URL(p, modelUrl).toString();
+        } catch (_) {
+          return p;
+        }
+      };
+
+      if (typeof refs.Moc === "string") refs.Moc = toAbs(refs.Moc);
+      if (typeof refs.Physics === "string") refs.Physics = toAbs(refs.Physics);
+      if (typeof refs.Pose === "string") refs.Pose = toAbs(refs.Pose);
+      if (typeof refs.DisplayInfo === "string") refs.DisplayInfo = toAbs(refs.DisplayInfo);
+      if (typeof refs.UserData === "string") refs.UserData = toAbs(refs.UserData);
+
+      if (Array.isArray(refs.Textures)) {
+        refs.Textures = refs.Textures.map(toAbs);
+      }
+
+      if (Array.isArray(refs.Expressions)) {
+        refs.Expressions = refs.Expressions.map((exp, idx) => {
+          const out = { ...(exp || {}) };
+          if (!out.Name) out.Name = `Expression${idx + 1}`;
+          if (typeof out.File === "string") out.File = toAbs(out.File);
+          return out;
+        });
+      }
+
+      if (refs.Motions && typeof refs.Motions === "object") {
+        // Some public models contain empty-string motion group keys that can
+        // crash older runtime adapters.
+        if (Array.isArray(refs.Motions[""])) {
+          const unnamed = refs.Motions[""];
+          delete refs.Motions[""];
+          if (!Array.isArray(refs.Motions.TapBody)) {
+            refs.Motions.TapBody = [];
+          }
+          refs.Motions.TapBody = refs.Motions.TapBody.concat(unnamed);
+        }
+        for (const group of Object.keys(refs.Motions)) {
+          const arr = refs.Motions[group];
+          if (!Array.isArray(arr)) continue;
+          refs.Motions[group] = arr.map((m) => {
+            const out = { ...(m || {}) };
+            if (typeof out.File === "string") out.File = toAbs(out.File);
+            return out;
+          });
+        }
+      }
+
+      if (Array.isArray(modelJson.HitAreas)) {
+        modelJson.HitAreas = modelJson.HitAreas.map((ha, idx) => {
+          const out = { ...(ha || {}) };
+          if (!out.Name || !String(out.Name).trim()) {
+            out.Name = out.Id || `HitArea${idx + 1}`;
+          }
+          return out;
+        });
+      }
+
+      if (STABLE_MODE) {
+        // Disable optional runtime features that are known to trigger errors
+        // on some model/runtime combinations.
+        delete refs.Physics;
+        delete refs.Pose;
+        delete refs.DisplayInfo;
+        modelJson.HitAreas = [];
+      }
+
+      modelJson.FileReferences = refs;
+      const blob = new Blob([JSON.stringify(modelJson)], { type: "application/json" });
+      return URL.createObjectURL(blob);
+    }
+
+    function setStatus(text) {
+      const el = document.getElementById("status");
+      if (el) el.textContent = text;
+      console.log("[Live2DStatus]", text);
+    }
+    function hideStatus() {
+      const el = document.getElementById("status");
+      if (el) el.style.display = "none";
+    }
+
+    window.addEventListener("error", (e) => {
+      console.error("[Live2DWindowError]", e.message, e.error || "");
+      // Keep status unchanged for non-fatal runtime errors from third-party libs.
+    });
+
+    window.addEventListener("unhandledrejection", (e) => {
+      console.error("[Live2DUnhandledRejection]", e.reason || e);
+      setStatus("Live2D Promise 异常: " + (e.reason?.message || String(e.reason || e)));
+    });
+
+    const Live2DHost = {
+      app: null,
+      model: null,
+      speaking: false,
+      _speakPhase: 0,
+      _baseY: 0,
+      _baseScale: 1,
+      _userScale: 1,
+      _offsetX: 0,
+      _offsetY: 0,
+      _dragging: false,
+      _dragMoved: false,
+      _fitLocked: false,
+      _lastDragMoveTs: 0,
+      _dragWindowDx: 0,
+      _dragWindowDy: 0,
+      _dragStartX: 0,
+      _dragStartY: 0,
+      _dragLastX: 0,
+      _dragLastY: 0,
+      _dragOriginX: 0,
+      _dragOriginY: 0,
+
+      async init(modelUrl) {
+        console.log("[Live2DInit] modelUrl=", modelUrl);
+
+        try {
+          setStatus("加载运行时...");
+          await ensureLive2DRuntime();
+
+          if (!window.PIXI || !window.PIXI.live2d || !window.PIXI.live2d.Live2DModel) {
+            throw new Error("PIXI.live2d.Live2DModel 未就绪");
+          }
+
+          setStatus("初始化渲染器...");
+          this.app = new PIXI.Application({
+            resizeTo: window,
+            transparent: true,
+            antialias: true,
+            backgroundAlpha: 0
+          });
+          document.getElementById("stage").appendChild(this.app.view);
+
+          setStatus("加载模型中...");
+          const patchedModelUrl = await buildPatchedModelUrl(modelUrl);
+          console.log("[Live2DInit] patchedModelUrl=", patchedModelUrl);
+          this.model = await PIXI.live2d.Live2DModel.from(patchedModelUrl, {
+            autoInteract: false,
+          });
+          console.log("[Live2DInit] model loaded");
+
+          this.model.anchor.set(0.5, 1.0);
+          this.app.stage.addChild(this.model);
+          this._fitModelToView();
+          this._bindInteractions();
+          window.addEventListener("resize", () => {
+            if (!this._fitLocked) this._fitModelToView();
+          });
+
+          this._bindTicker();
+          setStatus("Live2D 加载完成");
+          hideStatus();
+        } catch (err) {
+          console.error("[Live2DInitError]", err);
+          const msg = err?.message || String(err);
+          if (String(msg).includes("live2dcubismcore")) {
+            setStatus("缺少 Cubism Core，请放置 assets/web/vendor/live2dcubismcore.min.js");
+          } else {
+            setStatus("模型加载失败: " + msg);
+          }
+        }
+      },
+
+      setExpression(expression) {
+        if (!this.model) return;
+        const manager = this.model.internalModel?.motionManager?.expressionManager;
+        const defs = this.model.internalModel?.settings?.expressions || [];
+        if (!manager || defs.length === 0) return;
+
+        const nameMap = {
+          neutral: ["neutral", "normal", "f01"],
+          happy: ["happy", "smile", "f02"],
+          sad: ["sad", "f03"],
+          angry: ["angry", "f04"],
+          surprised: ["surprised", "f05"],
+          shy: ["shy", "f06"]
+        };
+
+        const key = String(expression || "neutral").toLowerCase();
+        const candidates = nameMap[key] || nameMap.neutral;
+        let index = -1;
+        for (let i = 0; i < defs.length; i++) {
+          const name = String(defs[i].Name || defs[i].name || "").toLowerCase();
+          if (candidates.some(c => name.includes(c))) {
+            index = i;
+            break;
+          }
+        }
+        if (index < 0) index = 0;
+        if (typeof manager.setExpression === "function") manager.setExpression(index);
+      },
+
+      playMotion(motion) {
+        if (!this.model) return;
+        const motions = this.model.internalModel?.settings?.motions || {};
+        const groups = Object.keys(motions).filter(g => Array.isArray(motions[g]) && motions[g].length > 0);
+        if (groups.length === 0) return;
+
+        const map = {
+          idle: ["idle", "Idle"],
+          wave: ["tap_body", "TapBody", "flick_head", "FlickHead", "idle", "Idle"],
+          tap_body: ["tap_body", "TapBody", "idle", "Idle"],
+          flick_head: ["flick_head", "FlickHead", "idle", "Idle"],
+          jump: ["shake", "Shake", "idle", "Idle"]
+        };
+
+        const key = String(motion || "idle").toLowerCase();
+        const candidates = map[key] || map.idle;
+        const group = candidates.find(g => groups.includes(g)) || groups[0];
+        if (!group || !Array.isArray(motions[group]) || motions[group].length === 0) {
+          console.warn("[Live2DMotionWarning] no playable motion group", motion, motions);
+          return;
+        }
+
+        try {
+          const ret = this.model.motion(group, 0, 3);
+          if (ret && typeof ret.catch === "function") {
+            ret.catch((e) => {
+              console.warn("[Live2DMotionWarning][async]", e);
+            });
+          }
+        } catch (e) {
+          console.warn("[Live2DMotionWarning]", e);
+        }
+      },
+
+      setSpeaking(flag) {
+        this.speaking = !!flag;
+      },
+
+      setFitLocked(flag, refit = true) {
+        this._fitLocked = !!flag;
+        if (!this._fitLocked && refit) {
+          this._fitModelToView();
+        }
+      },
+
+      nudgeOffset(dx, dy) {
+        if (!this.model) return;
+        const nx = Number(dx || 0);
+        const ny = Number(dy || 0);
+        if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
+        this._offsetX += nx;
+        this._offsetY += ny;
+        this._fitModelToView();
+      },
+
+      getModelBounds() {
+        if (!this.model) return null;
+        try {
+          const b = this.model.getBounds();
+          const now = Date.now();
+          const dragActive = this._dragging && this._dragMoved && (now - this._lastDragMoveTs <= 90);
+          let moveDx = this._dragWindowDx;
+          let moveDy = this._dragWindowDy;
+          if (Math.abs(moveDx) < 0.5) moveDx = 0;
+          if (Math.abs(moveDy) < 0.5) moveDy = 0;
+          this._dragWindowDx = 0;
+          this._dragWindowDy = 0;
+          return {
+            left: Number(b.x || 0),
+            top: Number(b.y || 0),
+            width: Number(b.width || 0),
+            height: Number(b.height || 0),
+            right: Number((b.x || 0) + (b.width || 0)),
+            bottom: Number((b.y || 0) + (b.height || 0)),
+            cx: Number((b.x || 0) + (b.width || 0) / 2),
+            cy: Number((b.y || 0) + (b.height || 0) / 2),
+            viewWidth: Number(window.innerWidth || 0),
+            viewHeight: Number(window.innerHeight || 0),
+            dragging: !!this._dragging,
+            dragMoved: !!this._dragMoved,
+            dragActive: !!dragActive,
+            moveDx: Number(moveDx || 0),
+            moveDy: Number(moveDy || 0)
+          };
+        } catch (e) {
+          console.warn("[Live2DBoundsWarning]", e);
+          return null;
+        }
+      },
+
+      _bindTicker() {
+        this.app.ticker.add((delta) => {
+          if (!this.model) return;
+          this._speakPhase += 0.1 * delta;
+          if (this.speaking) {
+            this.model.y = this._baseY + this._offsetY + Math.sin(this._speakPhase) * 3;
+          } else {
+            this.model.y = this._baseY + this._offsetY;
+          }
+        });
+      },
+
+      _fitModelToView() {
+        if (!this.model) return;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        if (!vw || !vh) return;
+
+        // Measure at unit scale, then fit to viewport.
+        this.model.scale.set(1);
+        const bounds = this.model.getLocalBounds();
+        const mw = Math.max(1, bounds.width || 0);
+        const mh = Math.max(1, bounds.height || 0);
+
+        const targetW = vw * 0.58;
+        const targetH = vh * 0.86;
+        const s = Math.min(targetW / mw, targetH / mh);
+        this._baseScale = Math.max(0.08, Math.min(s, 2.0));
+        const scale = this._baseScale * this._userScale;
+        this.model.scale.set(scale);
+
+        this.model.x = vw * 0.5 + this._offsetX;
+        this._baseY = vh * 0.98;
+        this.model.y = this._baseY + this._offsetY;
+      },
+
+      _bindInteractions() {
+        const canvas = this.app?.view;
+        if (!canvas) return;
+
+        canvas.addEventListener(
+          "wheel",
+          (ev) => {
+            if (!this.model) return;
+            ev.preventDefault();
+            const mouse = new PIXI.Point(ev.clientX, ev.clientY);
+            const localBefore = this.model.toLocal(mouse);
+            const delta = ev.deltaY < 0 ? 1.08 : 0.92;
+            this._userScale = Math.max(0.35, Math.min(this._userScale * delta, 3.0));
+            this._fitModelToView();
+
+            // Keep the point under cursor stable while zooming.
+            const globalAfter = this.model.toGlobal(localBefore);
+            this._offsetX += mouse.x - globalAfter.x;
+            this._offsetY += mouse.y - globalAfter.y;
+            this._fitModelToView();
+          },
+          { passive: false }
+        );
+
+        canvas.addEventListener("pointerdown", (ev) => {
+          if (ev.button !== 0) return;
+          this._dragging = true;
+          this._dragMoved = false;
+          this._lastDragMoveTs = Date.now();
+          this._dragWindowDx = 0;
+          this._dragWindowDy = 0;
+          this._dragStartX = ev.clientX;
+          this._dragStartY = ev.clientY;
+          this._dragLastX = ev.clientX;
+          this._dragLastY = ev.clientY;
+          this._dragOriginX = this._offsetX;
+          this._dragOriginY = this._offsetY;
+          try { canvas.setPointerCapture(ev.pointerId); } catch (_) {}
+        });
+
+        const moveDrag = (ev) => {
+          if (!this._dragging) return;
+          const dx = ev.clientX - this._dragStartX;
+          const dy = ev.clientY - this._dragStartY;
+          const stepDx = ev.clientX - this._dragLastX;
+          const stepDy = ev.clientY - this._dragLastY;
+          this._dragLastX = ev.clientX;
+          this._dragLastY = ev.clientY;
+          this._lastDragMoveTs = Date.now();
+          if (!this._dragMoved && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) {
+            this._dragMoved = true;
+          }
+          if (this._dragMoved) {
+            // Apply a small deadzone to avoid jitter accumulating in moveDx/moveDy.
+            if (Math.abs(stepDx) >= 0.5) this._dragWindowDx += stepDx;
+            if (Math.abs(stepDy) >= 0.5) this._dragWindowDy += stepDy;
+          }
+          // Drag now drives host-window movement; avoid local model drift.
+        };
+        canvas.addEventListener("pointermove", moveDrag);
+        window.addEventListener("pointermove", moveDrag);
+
+        const stopDrag = (ev) => {
+          if (!this._dragging) return;
+          this._dragging = false;
+          this._dragMoved = false;
+          this._lastDragMoveTs = 0;
+          this._dragWindowDx = 0;
+          this._dragWindowDy = 0;
+          try { canvas.releasePointerCapture(ev.pointerId); } catch (_) {}
+        };
+        canvas.addEventListener("pointerup", stopDrag);
+        canvas.addEventListener("pointercancel", stopDrag);
+        window.addEventListener("pointerup", stopDrag);
+        window.addEventListener("pointercancel", stopDrag);
+      },
+
+      _keepModelVisibleDuringDrag() {
+        if (!this.model || !this._dragging) return;
+        const b = this.model.getBounds();
+        const vw = window.innerWidth || 0;
+        const vh = window.innerHeight || 0;
+        if (vw <= 1 || vh <= 1) return;
+
+        // Keep at least a small visible area in viewport during fast drag.
+        const minVisibleX = 90;
+        const minVisibleY = 120;
+        let ax = 0;
+        let ay = 0;
+
+        if (b.right < minVisibleX) {
+          ax = minVisibleX - b.right;
+        } else if (b.left > vw - minVisibleX) {
+          ax = (vw - minVisibleX) - b.left;
+        }
+
+        if (b.bottom < minVisibleY) {
+          ay = minVisibleY - b.bottom;
+        } else if (b.top > vh - minVisibleY) {
+          ay = (vh - minVisibleY) - b.top;
+        }
+
+        if (Math.abs(ax) < 0.01 && Math.abs(ay) < 0.01) return;
+        this._offsetX += ax;
+        this._offsetY += ay;
+        // Keep current drag trajectory continuous after clamp.
+        this._dragOriginX += ax;
+        this._dragOriginY += ay;
+        this._fitModelToView();
+      }
+    };
+
+    window.Live2DHost = Live2DHost;
+  </script>
+</body>
+</html>
