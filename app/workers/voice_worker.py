@@ -66,6 +66,14 @@ class VoiceWorker(QThread):
         self._recent_open_ema = 0.0
         self._speech_nonzero_start_ms = -1
         self._speech_nonzero_end_ms = -1
+        self._ffmpeg_exe = self._resolve_ffmpeg_exe()
+        if self._rhubarb_enabled():
+            if self._ffmpeg_exe:
+                logging.info("Using ffmpeg: %s", self._ffmpeg_exe)
+            else:
+                logging.warning(
+                    "ffmpeg not found at init. Put ffmpeg.exe in project root or set FFMPEG_EXE/PATH."
+                )
 
     def run(self):
         loop = asyncio.new_event_loop()
@@ -291,15 +299,34 @@ class VoiceWorker(QThread):
             # Keep punctuation shaping, but do not send SSML/XML to edge-tts.
             payload = re.sub(r"\s+", " ", payload)
 
-        return await self._stream_tts(
-            payload,
-            voice_name,
-            session_id,
-            rate=rate,
-            pitch=pitch,
-            volume=volume,
-            output_format=output_format,
-        )
+        try:
+            return await self._stream_tts(
+                payload,
+                voice_name,
+                session_id,
+                rate=rate,
+                pitch=pitch,
+                volume=volume,
+                output_format=output_format,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "No audio was received" not in msg:
+                raise
+            fallback = re.sub(r"[，。！？；：、,.!?;:'\"“”‘’（）()\[\]《》【】\-—…]+", " ", payload)
+            fallback = re.sub(r"\s+", " ", fallback).strip()
+            if not fallback or not self._has_speakable_chars(fallback):
+                raise RuntimeError("No audio was received (segment not speakable after sanitize).")
+            logging.warning("TTS no-audio on segment, retry with fallback text: %r", fallback[:80])
+            return await self._stream_tts(
+                fallback,
+                voice_name,
+                session_id,
+                rate=rate,
+                pitch=pitch,
+                volume=volume,
+                output_format=output_format,
+            )
 
     async def _stream_tts(
         self,
@@ -468,14 +495,14 @@ class VoiceWorker(QThread):
         src_path.write_bytes(audio_bytes)
         wav_path = tdp / "tts_audio.wav"
 
-        project_ffmpeg = Path(__file__).resolve().parents[2] / "ffmpeg.exe"
-        ffmpeg_exe = str(project_ffmpeg) if project_ffmpeg.exists() else shutil.which("ffmpeg")
+        ffmpeg_exe = self._ffmpeg_exe or self._resolve_ffmpeg_exe()
+        if ffmpeg_exe and not self._ffmpeg_exe:
+            self._ffmpeg_exe = ffmpeg_exe
         if not ffmpeg_exe:
             logging.warning(
                 "Rhubarb requires WAV input, but ffmpeg was not found. Put ffmpeg.exe in project root or set PATH/FFMPEG_EXE."
             )
             return None
-        logging.info("Using ffmpeg: %s", ffmpeg_exe)
 
         cmd = [
             ffmpeg_exe,
@@ -503,6 +530,16 @@ class VoiceWorker(QThread):
             logging.warning("ffmpeg convert to wav failed: %s", proc.stderr.strip())
             return None
         return wav_path
+
+    def _resolve_ffmpeg_exe(self) -> str:
+        env_ffmpeg = os.getenv("FFMPEG_EXE", "").strip()
+        if env_ffmpeg and Path(env_ffmpeg).exists():
+            return env_ffmpeg
+        project_ffmpeg = Path(__file__).resolve().parents[2] / "ffmpeg.exe"
+        if project_ffmpeg.exists():
+            return str(project_ffmpeg)
+        sys_ffmpeg = shutil.which("ffmpeg")
+        return sys_ffmpeg or ""
 
     def _cleanup_zero_visemes(self, timeline: list[tuple[int, int]]) -> list[tuple[int, int]]:
         if len(timeline) < 3:
@@ -878,8 +915,12 @@ class VoiceWorker(QThread):
     def add_payload(self, payload: dict):
         if not self._enabled:
             return
-        text = str((payload or {}).get("text", "")).strip()
-        if not text:
+        raw_text = str((payload or {}).get("text", "")).strip()
+        if not raw_text:
+            return
+        text = self._sanitize_tts_text(raw_text)
+        if not text or not self._has_speakable_chars(text):
+            logging.info("Skip TTS segment after sanitize: raw=%r", raw_text)
             return
         normalized = {
             "text": text,
@@ -887,6 +928,35 @@ class VoiceWorker(QThread):
             "emotion_timeline": (payload or {}).get("emotion_timeline", []) or [],
         }
         self.text_queue.put((self._session_id, normalized))
+
+    def _sanitize_tts_text(self, text: str) -> str:
+        s = str(text or "")
+        if not s:
+            return ""
+        # Remove XML/SSML tags and hidden control chars.
+        s = re.sub(r"<[^>]+>", " ", s)
+        s = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", s)
+        # Strip most emoji blocks so they remain in UI text but are not spoken.
+        s = re.sub(r"[\U0001F1E6-\U0001F1FF]", " ", s)  # flags
+        s = re.sub(r"[\U0001F300-\U0001FAFF]", " ", s)  # emoji
+        s = re.sub(r"[\u2600-\u27BF]", " ", s)          # dingbats/symbols
+        # Keep Chinese/English/numbers/common punctuation only.
+        s = re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fff\s，。！？；：、,.!?;:'\"“”‘’（）()\[\]《》【】\-—…]",
+            " ",
+            s,
+        )
+        s = re.sub(r"[ \t]+", " ", s)
+        s = re.sub(r"\s*\n\s*", "，", s)
+        return s.strip()
+
+    def _has_speakable_chars(self, text: str) -> bool:
+        s = str(text or "")
+        for ch in s:
+            o = ord(ch)
+            if ("0" <= ch <= "9") or ("A" <= ch <= "Z") or ("a" <= ch <= "z") or (0x4E00 <= o <= 0x9FFF):
+                return True
+        return False
 
     @pyqtSlot()
     def start_new_session(self):

@@ -33,7 +33,7 @@ class MouthControlWindow(QMainWindow):
         self._model_server: LocalModelServer | None = None
         model_url = self._prepare_model_url()
 
-        self.view = Live2DWebView(self, model_url=model_url, no_motion_mode=True)
+        self.view = Live2DWebView(self, model_url=model_url)
 
         root = QWidget(self)
         self.setCentralWidget(root)

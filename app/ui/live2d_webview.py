@@ -34,11 +34,9 @@ class Live2DWebView(QWebEngineView):
         self,
         parent=None,
         model_url: str | None = None,
-        no_motion_mode: bool = False,
     ):
         super().__init__(parent)
         self._model_url = model_url
-        self._no_motion_mode = bool(no_motion_mode)
         self.setPage(LoggingWebEnginePage(self))
         settings = self.settings()
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
@@ -47,10 +45,7 @@ class Live2DWebView(QWebEngineView):
         self.page().setBackgroundColor(QColor(0, 0, 0, 0))
         html_path = Path(__file__).resolve().parents[2] / "assets" / "web" / "index.html"
         url = QUrl.fromLocalFile(str(html_path))
-        query = [f"v={int(time.time())}"]
-        if self._no_motion_mode:
-            query.append("no_motion=1")
-        url.setQuery("&".join(query))
+        url.setQuery(f"v={int(time.time())}")
         logger.info("Loading web page: %s?%s", html_path, url.query())
         self.load(url)
         self.loadFinished.connect(self._on_load_finished)
@@ -83,6 +78,13 @@ class Live2DWebView(QWebEngineView):
     def trigger_emphasis(self, strength: float = 0.7):
         s = max(0.0, min(1.0, strength))
         self.page().runJavaScript(f"window.triggerEmphasis && window.triggerEmphasis({s:.2f});")
+
+    def set_eye_follow_enabled(self, enabled: bool):
+        logger.info("Set eye follow: %s", enabled)
+        self._run_js(
+            "window.setEyeFollowEnabled",
+            [bool(enabled)],
+        )
 
     def debug_speaking(self, callback=None):
         """Debug current speaking state from web runtime."""

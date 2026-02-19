@@ -77,6 +77,10 @@ class ArcButton(QWidget):
         self.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
         self.update()
 
+    def set_label(self, label: str):
+        self._label = label
+        self.update()
+
     def _rebuild_path(self):
         path = QPainterPath()
         outer = QRectF(
@@ -166,6 +170,7 @@ class ArcButton(QWidget):
 class ModelActionPanel(QWidget):
     open_chat_clicked = pyqtSignal()
     close_app_clicked = pyqtSignal()
+    eye_follow_toggled = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -180,13 +185,20 @@ class ModelActionPanel(QWidget):
     def _build_ui(self):
         self.chat_btn = ArcButton("Chat", self)
         self.close_btn = ArcButton("Exit", self)
-        self.top_btn = ArcButton("", self)
+        self.top_btn = ArcButton("Eyes ON", self)
         self.bottom_btn = ArcButton("", self)
+        self._eye_follow_enabled = True
         self.chat_btn.clicked.connect(self.open_chat_clicked.emit)
         self.close_btn.clicked.connect(self.close_app_clicked.emit)
-        self.top_btn.set_enabled(False)
+        self.top_btn.clicked.connect(self._toggle_eye_follow)
+        self.top_btn.set_enabled(True)
         self.bottom_btn.set_enabled(False)
         self._layout_arcs()
+
+    def _toggle_eye_follow(self):
+        self._eye_follow_enabled = not self._eye_follow_enabled
+        self.top_btn.set_label("Eyes ON" if self._eye_follow_enabled else "Eyes OFF")
+        self.eye_follow_toggled.emit(self._eye_follow_enabled)
 
     def _layout_arcs(self):
         center = self.rect().center()
@@ -227,6 +239,8 @@ class ModelActionPanel(QWidget):
                 self.open_chat_clicked.emit()
             elif hit is self.close_btn:
                 self.close_app_clicked.emit()
+            elif hit is self.top_btn:
+                self._toggle_eye_follow()
         super().mousePressEvent(event)
 
     def leaveEvent(self, event):
@@ -299,9 +313,12 @@ class DesktopPetWindow(QWidget):
         self._action_panel = ModelActionPanel()
         self._action_panel.open_chat_clicked.connect(self._open_chat)
         self._action_panel.close_app_clicked.connect(self._quit_app)
+        self._action_panel.eye_follow_toggled.connect(self._on_eye_follow_toggled)
 
         model_url = self._prepare_model_url()
-        self.live2d_view = Live2DWebView(self, model_url=model_url, no_motion_mode=True)
+        # Enable motion in main app; mouth priority is still enforced in web runtime.
+        self.live2d_view = Live2DWebView(self, model_url=model_url)
+        self.live2d_view.set_eye_follow_enabled(True)
         self.live2d_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.live2d_view.customContextMenuRequested.connect(self._show_action_panel)
 
@@ -514,6 +531,9 @@ class DesktopPetWindow(QWidget):
         self._action_panel.show()
         self._action_panel.raise_()
         self._action_panel.activateWindow()
+
+    def _on_eye_follow_toggled(self, enabled: bool):
+        self.live2d_view.set_eye_follow_enabled(enabled)
 
     # ================================================================
     # 闂?婵犵數鍎戠徊钘壝归崒鐐茬獥婵°倕鎳庨弸浣糕攽閸屾碍鍟為柡鍜佸墯閹便劌顫滈崱妤€顫梻濠庡墻閸撶喎顕ｉ崼鏇熷€婚柛鈩冾殕閻忔洖顪冮妶鍡樼妞ゃ劌锕ら悾鐑藉醇閺囩喎鈧兘鏌涢幘鑼妽妞ゆ柨绉电换娑㈠箣閻愬瓨鍎庨梺鍛娒晶钘壩ｉ幇鐗堟櫆闂佹鍨版禍?bounds 婵犵數鍋為幐鑽ゅ枈瀹ュ洨鐭欓柟鎹愵嚙绾惧鏌ㄥ┑鍡╂Ц缂佲偓閸曨垱鐓犲┑顔藉姇閳ь剚鍔欏顐㈩吋婢跺鎷哄銈嗗姂閸ㄨ崵绮婚敐鍛斀闁绘劕寮堕崰姗€鏌?    # ================================================================
