@@ -66,8 +66,6 @@
         ],
         "pixi"
       );
-
-      // Cubism Core is required before cubism4.min.js.
       await loadFirstAvailable(
         [
           "./vendor/live2dcubismcore.min.js",
@@ -76,8 +74,6 @@
         ],
         "live2dcubismcore"
       );
-
-      // Only load Cubism4 adapter. Do NOT load index.min.js to avoid Cubism2 runtime checks.
       await loadFirstAvailable(
         [
           "https://unpkg.com/pixi-live2d-display@0.4.0/dist/cubism4.min.js",
@@ -88,6 +84,11 @@
     }
 
     const STABLE_MODE = true;
+    const URL_PARAMS = new URLSearchParams(window.location.search || "");
+    // Optional diagnostic mode: add `?no_motion=1` to URL.
+    const NO_MOTION_MODE = URL_PARAMS.get("no_motion") === "1";
+    window.__NO_MOTION_MODE = NO_MOTION_MODE;
+    console.log("[Config] NO_MOTION_MODE =", NO_MOTION_MODE);
 
     async function buildPatchedModelUrl(modelUrl) {
       const resp = await fetch(modelUrl, { cache: "no-store" });
@@ -99,11 +100,8 @@
 
       const toAbs = (p) => {
         if (!p || typeof p !== "string") return p;
-        try {
-          return new URL(p, modelUrl).toString();
-        } catch (_) {
-          return p;
-        }
+        try { return new URL(p, modelUrl).toString(); }
+        catch (_) { return p; }
       };
 
       if (typeof refs.Moc === "string") refs.Moc = toAbs(refs.Moc);
@@ -126,8 +124,6 @@
       }
 
       if (refs.Motions && typeof refs.Motions === "object") {
-        // Some public models contain empty-string motion group keys that can
-        // crash older runtime adapters.
         if (Array.isArray(refs.Motions[""])) {
           const unnamed = refs.Motions[""];
           delete refs.Motions[""];
@@ -158,8 +154,6 @@
       }
 
       if (STABLE_MODE) {
-        // Disable optional runtime features that are known to trigger errors
-        // on some model/runtime combinations.
         delete refs.Physics;
         delete refs.Pose;
         delete refs.DisplayInfo;
@@ -183,14 +177,533 @@
 
     window.addEventListener("error", (e) => {
       console.error("[Live2DWindowError]", e.message, e.error || "");
-      // Keep status unchanged for non-fatal runtime errors from third-party libs.
     });
-
     window.addEventListener("unhandledrejection", (e) => {
       console.error("[Live2DUnhandledRejection]", e.reason || e);
       setStatus("Live2D Promise 异常: " + (e.reason?.message || String(e.reason || e)));
     });
 
+
+    // ============================================================
+    // ★ 柏林噪声 —— 生成自然的非重复随机运动
+    // ============================================================
+    class SimpleNoise {
+      constructor(seed) { this.seed = seed || Math.random() * 65536; }
+      noise(x) {
+        const xi = Math.floor(x);
+        const xf = x - xi;
+        const u = xf * xf * (3 - 2 * xf);
+        return this._lerp(this._hash(xi), this._hash(xi + 1), u);
+      }
+      fbm(x, octaves) {
+        let v = 0, a = 1, f = 1, m = 0;
+        for (let i = 0; i < (octaves || 3); i++) {
+          v += this.noise(x * f) * a;
+          m += a; a *= 0.5; f *= 2;
+        }
+        return v / m;
+      }
+      _hash(n) {
+        let x = Math.sin((n + this.seed) * 127.1 + this.seed * 311.7) * 43758.5453;
+        return (x - Math.floor(x)) * 2 - 1;
+      }
+      _lerp(a, b, t) { return a + (b - a) * t; }
+    }
+
+
+    // ============================================================
+    // ★ 说话动画引擎（头部/身体/眉毛/眨眼）
+    // ============================================================
+    const _noise = {
+      hx: new SimpleNoise(101),
+      hy: new SimpleNoise(202),
+      hz: new SimpleNoise(303),
+      bx: new SimpleNoise(404),
+      by: new SimpleNoise(505),
+      brow: new SimpleNoise(606),
+    };
+
+    const _anim = {
+      // 状态
+      isSpeaking: false,
+      mouthValue: 0,
+      smoothedMouth: 0,
+      mouthShape: 'A',
+      manualMouthMode: false,
+      visemeWeights: null,
+      visemeActiveUntil: 0,
+      emotion: 'neutral',
+      globalTime: 0,
+      speakingTime: 0,
+
+      // 平滑输出
+      headX: 0, headY: 0, headZ: 0,
+      bodyX: 0, bodyY: 0,
+      browL: 0, browR: 0,
+
+      // 眨眼
+      blinkTimer: 3.0,
+      blinkPhase: -1,
+      BLINK_DUR: 0.12,
+
+      // 点头
+      nodQueue: [],
+      nodActive: false,
+      nodPhase: 0,
+      nodStrength: 0,
+
+      // 参数索引缓存
+      paramCache: {},
+      _lastMouthLogTs: 0,
+    };
+    const DEBUG_MOUTH_LOG = false;
+
+
+    // Core animation pass: runs after runtime updates each frame.
+    function applyGestureParams(coreModel, dt) {
+      if (!coreModel) return;
+
+      const dtSecRaw = Number(dt);
+      const dtSec = Number.isFinite(dtSecRaw) && dtSecRaw > 0 ? dtSecRaw : (1 / 60);
+
+      _anim.globalTime += dtSec;
+      if (_anim.isSpeaking) _anim.speakingTime += dtSec;
+      const t = _anim.globalTime;
+      const speaking = _anim.isSpeaking;
+      const spkMul = speaking ? 1.6 : 1.0;
+      const sm = _anim.smoothedMouth;
+      const expr = (window.Live2DHost && window.Live2DHost._currentExpression) || 'neutral';
+      const closedEyeExpr = (expr === 'shy');
+
+      // ---- 头部晃动 ----
+      const hs = speaking ? 0.35 : 0.18;
+      let tHX = _noise.hx.fbm(t * hs, 2) * (speaking ? 1.9 * spkMul : 0.2);
+      let tHY = _noise.hy.fbm(t * (speaking ? 0.28 : 0.16), 2) * (speaking ? 1.6 * spkMul : 0.16);
+      let tHZ = _noise.hz.fbm(t * hs * 0.45, 2) * (speaking ? 1.2 * spkMul : 0.12);
+
+      // 嘴巴张大 → 头微微往下点
+      if (speaking && sm > 0.15) {
+        tHY += sm * 2.5;
+      }
+
+      // ---- 点头处理 ----
+      if (!_anim.nodActive && _anim.nodQueue.length > 0) {
+        _anim.nodActive = true;
+        _anim.nodPhase = 0;
+        _anim.nodStrength = _anim.nodQueue.shift();
+      }
+      if (_anim.nodActive) {
+        _anim.nodPhase += dtSec / 0.28;
+        if (_anim.nodPhase >= 1.0) {
+          _anim.nodActive = false;
+        } else {
+          tHY += Math.sin(_anim.nodPhase * Math.PI) * _anim.nodStrength * 3.2;
+        }
+      }
+
+      // ---- 身体 ----
+      const bs = speaking ? 0.24 : 0.15;
+      let tBX = _noise.bx.fbm(t * bs, 2) * (speaking ? 1.1 : 0.18);
+      let tBY = _noise.by.fbm(t * bs * 0.5, 2) * (speaking ? 0.9 : 0.15);
+
+      // ---- 眉毛 ----
+      let tBrow = _noise.brow.fbm(t * 0.5, 2) * (speaking ? 0.3 : 0.08);
+      if (speaking) {
+        tBrow += sm * 0.25;
+        tBrow *= 1.8;
+      }
+      const emo = _anim.emotion;
+      if (emo === 'happy') tBrow += 0.2;
+      else if (emo === 'sad') tBrow -= 0.3;
+      else if (emo === 'angry') tBrow -= 0.4;
+      else if (emo === 'surprised') tBrow += 0.5;
+
+      // ---- 眨眼 ----
+      let eyeOpen = 1.0;
+      _anim.blinkTimer -= dtSec;
+      if (_anim.blinkPhase >= 0) {
+        _anim.blinkPhase += dtSec;
+        if (_anim.blinkPhase < _anim.BLINK_DUR) {
+          const p = _anim.blinkPhase / _anim.BLINK_DUR;
+          eyeOpen = p < 0.4 ? (1 - p / 0.4) : ((p - 0.4) / 0.6);
+          eyeOpen = Math.max(0, Math.min(1, eyeOpen));
+        } else {
+          _anim.blinkPhase = -1;
+        }
+      } else if (_anim.blinkTimer <= 0) {
+        _anim.blinkPhase = 0;
+        const minI = speaking ? 1.5 : 2.5;
+        const maxI = speaking ? 4.0 : 6.0;
+        _anim.blinkTimer = minI + Math.random() * (maxI - minI);
+      }
+
+      if (NO_MOTION_MODE) {
+        tHX = 0;
+        tHY = 0;
+        tHZ = 0;
+        tBX = 0;
+        tBY = 0;
+        tBrow = 0;
+      }
+
+      // ---- 平滑 ----
+      const s = 0.22;
+      _anim.headX += (tHX - _anim.headX) * (1 - s);
+      _anim.headY += (tHY - _anim.headY) * (1 - s);
+      _anim.headZ += (tHZ - _anim.headZ) * (1 - s);
+      _anim.bodyX += (tBX - _anim.bodyX) * (1 - s * 1.5);
+      _anim.bodyY += (tBY - _anim.bodyY) * (1 - s * 1.5);
+      _anim.browL += (tBrow - _anim.browL) * (1 - s);
+      _anim.browR += (tBrow * 0.9 - _anim.browR) * (1 - s);
+
+      // ---- Apply procedural pose params ----
+      _tryAdd(coreModel, 'ParamAngleX', _anim.headX);
+      _tryAdd(coreModel, 'ParamAngleY', _anim.headY);
+      _tryAdd(coreModel, 'ParamAngleZ', _anim.headZ);
+      _tryAdd(coreModel, 'ParamBodyAngleX', _anim.bodyX);
+      _tryAdd(coreModel, 'ParamBodyAngleY', _anim.bodyY);
+      // On this model, eyebrow animation can pull eyes open in closed-eye expressions.
+      if (!closedEyeExpr) {
+        _tryAdd(coreModel, 'ParamBrowLY', _anim.browL);
+        _tryAdd(coreModel, 'ParamBrowRY', _anim.browR);
+      }
+
+      // Mouth: pure externally-driven viseme/lip value (no synthetic pulse rhythm).
+      const baseMouth = Math.max(0, Math.min(1, _anim.smoothedMouth));
+      const mouth = baseMouth;
+      // Use absolute set (not additive) so motion curves cannot keep opening mouth
+      // when external controller sets AIUEO to zero.
+      _setMouthParams(coreModel, mouth);
+
+      // Eye control:
+      // For closed-eye expressions, lock eyes each frame to avoid 1-2 frame flicker
+      // from idle motions / internal blink.
+      if (closedEyeExpr) {
+        _trySet(coreModel, 'ParamEyeLOpen', 0.0);
+        _trySet(coreModel, 'ParamEyeROpen', 0.0);
+        _trySet(coreModel, 'ParamEyeLSmile', 1.0);
+        _trySet(coreModel, 'ParamEyeRSmile', 1.0);
+      } else {
+        _trySet(coreModel, 'ParamEyeLOpen', eyeOpen);
+        _trySet(coreModel, 'ParamEyeROpen', eyeOpen);
+      }
+    }
+
+
+    // ---- 参数设置辅助（自动兼容不同命名） ----
+    function _resolveParam(coreModel, paramId) {
+      if (_anim.paramCache[paramId] !== undefined) return _anim.paramCache[paramId];
+      const variants = [paramId];
+      // ParamAngleX → PARAM_ANGLE_X
+      const upper = paramId.replace(/^Param/, '').replace(/([A-Z])/g, '_$1').toUpperCase();
+      variants.push('PARAM' + upper);
+      // ParamAngleX → Param_AngleX
+      variants.push(paramId.replace(/^Param/, 'Param_'));
+
+      for (const name of variants) {
+        try {
+          const idx = coreModel.getParameterIndex(name);
+          if (idx >= 0) {
+            _anim.paramCache[paramId] = idx;
+            console.log(`[Param] ${paramId} → ${name} (idx=${idx})`);
+            return idx;
+          }
+        } catch(e) {}
+      }
+      _anim.paramCache[paramId] = -1;
+      return -1;
+    }
+
+    function _tryAdd(coreModel, paramId, value) {
+      try {
+        if (typeof coreModel.addParameterValueById === 'function') {
+          coreModel.addParameterValueById(paramId, value);
+          return;
+        }
+      } catch(e) {}
+      const idx = _resolveParam(coreModel, paramId);
+      if (idx >= 0) {
+        try { coreModel.addParameterValueByIndex(idx, value); } catch(e) {}
+      }
+    }
+
+    function _trySet(coreModel, paramId, value) {
+      let setByIdTried = false;
+      try {
+        if (typeof coreModel.setParameterValueById === 'function') {
+          coreModel.setParameterValueById(paramId, value);
+          setByIdTried = true;
+        }
+      } catch(e) {}
+      const idx = _resolveParam(coreModel, paramId);
+      if (idx >= 0) {
+        try { coreModel.setParameterValueByIndex(idx, value); } catch(e) {}
+      } else if (!setByIdTried && DEBUG_MOUTH_LOG && /^Param(Mouth|A|I|U|E|O)/.test(paramId)) {
+        console.warn('[MouthParamMissing]', paramId);
+      }
+    }
+
+    function _currentMouthWeights() {
+      const now = performance.now();
+      if (_anim.manualMouthMode && _anim.visemeWeights) {
+        const vw = _anim.visemeWeights;
+        return {
+          A: Math.max(0, Math.min(1, Number(vw.A) || 0)),
+          I: Math.max(0, Math.min(1, Number(vw.I) || 0)),
+          U: Math.max(0, Math.min(1, Number(vw.U) || 0)),
+          E: Math.max(0, Math.min(1, Number(vw.E) || 0)),
+          O: Math.max(0, Math.min(1, Number(vw.O) || 0)),
+        };
+      }
+      if (_anim.visemeWeights && (_anim.isSpeaking || now <= (_anim.visemeActiveUntil || 0))) {
+        const vw = _anim.visemeWeights;
+        return {
+          A: Math.max(0, Math.min(1, Number(vw.A) || 0)),
+          I: Math.max(0, Math.min(1, Number(vw.I) || 0)),
+          U: Math.max(0, Math.min(1, Number(vw.U) || 0)),
+          E: Math.max(0, Math.min(1, Number(vw.E) || 0)),
+          O: Math.max(0, Math.min(1, Number(vw.O) || 0)),
+        };
+      }
+      // No fallback mouth shape while speaking:
+      // if current frame has no valid viseme weights, force close to avoid auto pulse.
+      if (_anim.isSpeaking) {
+        return { A: 0, I: 0, U: 0, E: 0, O: 0 };
+      }
+      const shape = (_anim.mouthShape || 'A').toUpperCase();
+      const w = { A: 0.04, I: 0.04, U: 0.04, E: 0.04, O: 0.04 };
+      w[shape] = 1.0;
+      return w;
+    }
+
+    function _setMouthParams(coreModel, value) {
+      const v = Math.max(0, Math.min(1, Number(value) || 0));
+      const w = _currentMouthWeights();
+      const a = v * w.A;
+      const i = v * w.I;
+      const u = v * w.U;
+      const e = v * w.E;
+      const o = v * w.O;
+      _trySet(coreModel, 'ParamA', a);
+      _trySet(coreModel, 'ParamI', i);
+      _trySet(coreModel, 'ParamU', u);
+      _trySet(coreModel, 'ParamE', e);
+      _trySet(coreModel, 'ParamO', o);
+
+      // Some Cubism models are primarily driven by these generic mouth params.
+      // Keep them synchronized to prevent motion curves from re-opening mouth.
+      const openY = Math.max(a, i, u, e, o);
+      const form = Math.max(-1, Math.min(1, (i * 0.8 + e * 0.6) - (u * 0.5 + o * 0.7)));
+      _trySet(coreModel, 'ParamMouthOpenY', openY);
+      _trySet(coreModel, 'ParamMouthForm', form);
+    }
+
+    function _applyMouthNow() {
+      const model = window.Live2DHost && window.Live2DHost.model;
+      const internal = model && model.internalModel;
+      const core = internal && internal.coreModel;
+      if (!core) return;
+      const base = Math.max(0, Math.min(1, _anim.smoothedMouth || 0));
+      const v = base;
+      _setMouthParams(core, v);
+      if (internal) {
+        try { internal.lipSyncValue = 0; } catch (_) {}
+      }
+      const now = performance.now();
+      if (DEBUG_MOUTH_LOG && _anim.isSpeaking && (now - _anim._lastMouthLogTs > 500)) {
+        _anim._lastMouthLogTs = now;
+        console.log('[Mouth]', 'value=', v.toFixed(3), 'speaking=', _anim.isSpeaking);
+      }
+    }
+
+
+    // ============================================================
+    // ★ 初始化说话系统：钩入框架的 updateParameters
+    // ============================================================
+    function initSpeakingSystem(model) {
+      const internal = model.internalModel;
+      if (!internal) {
+        console.error('[SpeakingSystem] No internalModel');
+        return;
+      }
+
+      // 1. 禁用框架内置 lipSync，避免与外部嘴型参数叠加
+      internal.lipSync = false;
+      internal.lipSyncValue = 0;
+
+      // 2. 钩入 updateParameters（在 motion 之后执行）
+      // 某些 runtime 版本上不存在 updateParameters，不能直接 bind。
+      if (typeof internal.updateParameters === "function") {
+        const originalUpdateParameters = internal.updateParameters.bind(internal);
+        internal.updateParameters = function(model, dt) {
+          originalUpdateParameters(model, dt);
+          applyGestureParams(internal.coreModel, dt);
+        };
+        console.log('[SpeakingSystem] Hooked internal.updateParameters');
+      } else if (typeof internal.update === "function") {
+        const originalUpdate = internal.update.bind(internal);
+        internal.update = function(dt, now) {
+          originalUpdate(dt, now);
+          applyGestureParams(internal.coreModel, dt || 1 / 60);
+        };
+        console.log('[SpeakingSystem] Hooked internal.update');
+      } else {
+        console.warn('[SpeakingSystem] No update hook found. Fallback to ticker-only mouth animation.');
+      }
+
+      // 3. 打印基础参数能力（兼容不同 core 实现）
+      try {
+        const core = internal.coreModel;
+        const count = (core && typeof core.getParameterCount === 'function')
+          ? core.getParameterCount()
+          : 'unknown';
+        console.log('[Model] ParameterCount:', count);
+        console.log('[Model] lipSyncIds:', internal.lipSyncIds);
+      } catch(e) {
+        console.warn('[Model] Could not list parameters:', e);
+      }
+
+      console.log('[SpeakingSystem] Initialized OK');
+    }
+
+
+    // ============================================================
+    // ★★★ window 全局接口 —— Python 通过这些函数控制 ★★★
+    // ============================================================
+
+    window.setSpeaking = function(speaking) {
+      _anim.isSpeaking = !!speaking;
+      Live2DHost.speaking = _anim.isSpeaking;
+
+      if (_anim.isSpeaking) {
+        _anim.speakingTime = 0;
+      } else {
+        _anim.mouthValue = 0;
+        _anim.smoothedMouth = 0;
+        _anim.mouthShape = 'A';
+        _anim.visemeWeights = null;
+        _anim.visemeActiveUntil = 0;
+        _anim.nodQueue = [];
+        _anim.nodActive = false;
+        if (Live2DHost.model && Live2DHost.model.internalModel) {
+          Live2DHost.model.internalModel.lipSyncValue = 0;
+        }
+      }
+      console.log('[Speaking]', speaking);
+    };
+
+    window.setMouthValue = function(value) {
+      _anim.manualMouthMode = false;
+      const v = Math.max(0, Math.min(1, Number(value) || 0));
+      _anim.mouthValue = v;
+
+      // Fast attack + release to keep quick open/close rhythm.
+      const speed = v > _anim.smoothedMouth ? 0.88 : 0.76;
+      _anim.smoothedMouth += (v - _anim.smoothedMouth) * speed;
+
+      // 仅由外部参数驱动，不使用内部 lipSync 叠加
+      if (Live2DHost.model && Live2DHost.model.internalModel) {
+        const internal = Live2DHost.model.internalModel;
+        internal.lipSyncValue = 0;
+        const core = internal.coreModel;
+        if (core) {
+          _setMouthParams(core, _anim.smoothedMouth);
+        }
+      }
+      _applyMouthNow();
+    };
+
+    // Immediate mode for manual testing: no smoothing, apply right now.
+    window.setMouthImmediate = function(value, weights) {
+      _anim.manualMouthMode = true;
+      const v = Math.max(0, Math.min(1, Number(value) || 0));
+      _anim.mouthValue = v;
+      _anim.smoothedMouth = v;
+      if (!weights || typeof weights !== 'object') {
+        _anim.visemeWeights = null;
+        _anim.visemeActiveUntil = 0;
+      } else {
+        _anim.visemeWeights = {
+          A: Math.max(0, Math.min(1, Number(weights.A) || 0)),
+          I: Math.max(0, Math.min(1, Number(weights.I) || 0)),
+          U: Math.max(0, Math.min(1, Number(weights.U) || 0)),
+          E: Math.max(0, Math.min(1, Number(weights.E) || 0)),
+          O: Math.max(0, Math.min(1, Number(weights.O) || 0)),
+        };
+        // Manual test mode should persist until the next explicit update.
+        _anim.visemeActiveUntil = Number.POSITIVE_INFINITY;
+      }
+      _applyMouthNow();
+    };
+
+    window.setMouthShape = function(shape) {
+      const s = String(shape || 'A').toUpperCase();
+      if (['A', 'I', 'U', 'E', 'O'].includes(s)) {
+        _anim.mouthShape = s;
+      } else {
+        _anim.mouthShape = 'A';
+      }
+    };
+
+    window.setViseme = function(weights) {
+      if (!weights || typeof weights !== 'object' || Object.keys(weights).length === 0) {
+        _anim.visemeWeights = null;
+        _anim.visemeActiveUntil = 0;
+        return;
+      }
+      _anim.visemeWeights = {
+        A: Math.max(0, Math.min(1, Number(weights.A) || 0)),
+        I: Math.max(0, Math.min(1, Number(weights.I) || 0)),
+        U: Math.max(0, Math.min(1, Number(weights.U) || 0)),
+        E: Math.max(0, Math.min(1, Number(weights.E) || 0)),
+        O: Math.max(0, Math.min(1, Number(weights.O) || 0)),
+      };
+      // Keep viseme tail for transition; while speaking, viseme remains active.
+      _anim.visemeActiveUntil = performance.now() + 500;
+    };
+
+    window.setEmotion = function(emotion) {
+      _anim.emotion = (emotion || 'neutral').toLowerCase();
+      // Emotion timeline should also drive expression resources,
+      // not only procedural brow/head params.
+      if (window.Live2DHost && typeof window.Live2DHost.setExpression === 'function') {
+        const e = _anim.emotion;
+        if (['neutral', 'happy', 'sad', 'angry', 'surprised', 'shy'].includes(e)) {
+          window.Live2DHost.setExpression(e);
+        }
+      }
+      console.log('[Emotion]', _anim.emotion);
+    };
+
+    window.triggerEmphasis = function(strength) {
+      const s = Math.max(0.1, Math.min(1.0, Number(strength) || 0.5));
+      _anim.nodQueue.push(s);
+      if (_anim.nodQueue.length > 5) _anim.nodQueue.shift();
+      console.log('[Emphasis]', s);
+    };
+
+    window.debugSpeaking = function() {
+      const m = Live2DHost.model;
+      const internal = m && m.internalModel;
+      return {
+        isSpeaking: _anim.isSpeaking,
+        mouthValue: _anim.mouthValue,
+        smoothedMouth: _anim.smoothedMouth,
+        mouthShape: _anim.mouthShape,
+        lipSync: internal ? internal.lipSync : 'no model',
+        lipSyncValue: internal ? internal.lipSyncValue : 'no model',
+        lipSyncIds: internal ? internal.lipSyncIds : 'no model',
+        headAngle: { x: _anim.headX.toFixed(2), y: _anim.headY.toFixed(2), z: _anim.headZ.toFixed(2) },
+        emotion: _anim.emotion,
+        nodQueue: _anim.nodQueue.length,
+        nodActive: _anim.nodActive,
+      };
+    };
+
+
+    // ============================================================
+    // Live2DHost 主对象
+    // ============================================================
     const Live2DHost = {
       app: null,
       model: null,
@@ -213,10 +726,11 @@
       _dragLastY: 0,
       _dragOriginX: 0,
       _dragOriginY: 0,
+      _clickHistory: [],
+      _currentExpression: "neutral",
 
       async init(modelUrl) {
         console.log("[Live2DInit] modelUrl=", modelUrl);
-
         try {
           setStatus("加载运行时...");
           await ensureLive2DRuntime();
@@ -250,7 +764,27 @@
             if (!this._fitLocked) this._fitModelToView();
           });
 
+          // ★★★ 初始化说话动画系统 ★★★
+          initSpeakingSystem(this.model);
+          if (NO_MOTION_MODE) {
+            try {
+              const internal = this.model.internalModel;
+              const mm = internal && internal.motionManager;
+              if (mm && typeof mm.stopAllMotions === "function") mm.stopAllMotions();
+              if (mm && typeof mm.update === "function") mm.update = function() {};
+              if (mm && typeof mm.startMotion === "function") mm.startMotion = function() { return Promise.resolve(); };
+              if (internal && internal.focusController && typeof internal.focusController.update === "function") {
+                internal.focusController.update = function() {};
+              }
+              console.log("[Live2DNoMotion] motion manager disabled");
+            } catch (e) {
+              console.warn("[Live2DNoMotion] stopAllMotions failed:", e);
+            }
+          }
+
+          // ★ 简化后的 ticker：只处理说话时的身体微微起伏
           this._bindTicker();
+
           setStatus("Live2D 加载完成");
           hideStatus();
         } catch (err) {
@@ -266,34 +800,44 @@
 
       setExpression(expression) {
         if (!this.model) return;
+        this._currentExpression = String(expression || "neutral").toLowerCase();
+        const internal = this.model.internalModel;
+        const closedEyeExpr = (this._currentExpression === "shy");
         const manager = this.model.internalModel?.motionManager?.expressionManager;
         const defs = this.model.internalModel?.settings?.expressions || [];
         if (!manager || defs.length === 0) return;
 
         const nameMap = {
-          neutral: ["neutral", "normal", "f01"],
-          happy: ["happy", "smile", "f02"],
-          sad: ["sad", "f03"],
-          angry: ["angry", "f04"],
-          surprised: ["surprised", "f05"],
-          shy: ["shy", "f06"]
+          neutral: ["exp_01", "exp_03", "neutral", "normal", "f01"],
+          happy: ["exp_06", "exp_07", "happy", "smile", "f06", "f07"],
+          sad: ["exp_05", "sad", "f03"],
+          angry: ["exp_08", "angry", "f04"],
+          surprised: ["exp_04", "surprised", "f05"],
+          shy: ["exp_06", "shy", "blush", "f06"]
         };
 
-        const key = String(expression || "neutral").toLowerCase();
+        const key = this._currentExpression;
         const candidates = nameMap[key] || nameMap.neutral;
         let index = -1;
         for (let i = 0; i < defs.length; i++) {
           const name = String(defs[i].Name || defs[i].name || "").toLowerCase();
-          if (candidates.some(c => name.includes(c))) {
-            index = i;
-            break;
-          }
+          if (candidates.some(c => name.includes(c))) { index = i; break; }
         }
         if (index < 0) index = 0;
         if (typeof manager.setExpression === "function") manager.setExpression(index);
+        if (closedEyeExpr && internal && internal.coreModel) {
+          const core = internal.coreModel;
+          _trySet(core, 'ParamEyeLOpen', 0.0);
+          _trySet(core, 'ParamEyeROpen', 0.0);
+          _trySet(core, 'ParamEyeLSmile', 1.0);
+          _trySet(core, 'ParamEyeRSmile', 1.0);
+          _trySet(core, 'ParamEyeBallX', 0.0);
+          _trySet(core, 'ParamEyeBallY', 0.0);
+        }
       },
 
       playMotion(motion) {
+        if (NO_MOTION_MODE) return;
         if (!this.model) return;
         const motions = this.model.internalModel?.settings?.motions || {};
         const groups = Object.keys(motions).filter(g => Array.isArray(motions[g]) && motions[g].length > 0);
@@ -306,36 +850,56 @@
           flick_head: ["flick_head", "FlickHead", "idle", "Idle"],
           jump: ["shake", "Shake", "idle", "Idle"]
         };
-
         const key = String(motion || "idle").toLowerCase();
         const candidates = map[key] || map.idle;
         const group = candidates.find(g => groups.includes(g)) || groups[0];
-        if (!group || !Array.isArray(motions[group]) || motions[group].length === 0) {
-          console.warn("[Live2DMotionWarning] no playable motion group", motion, motions);
-          return;
-        }
+        if (!group || !Array.isArray(motions[group]) || motions[group].length === 0) return;
 
         try {
           const ret = this.model.motion(group, 0, 3);
           if (ret && typeof ret.catch === "function") {
-            ret.catch((e) => {
-              console.warn("[Live2DMotionWarning][async]", e);
-            });
+            ret.catch((e) => console.warn("[Live2DMotionWarning][async]", e));
           }
         } catch (e) {
           console.warn("[Live2DMotionWarning]", e);
         }
       },
 
+      _playMotionByFilter(filterFn) {
+        if (NO_MOTION_MODE) return;
+        if (!this.model) return;
+        const motions = this.model.internalModel?.settings?.motions || {};
+        const groups = Object.keys(motions).filter(g => Array.isArray(motions[g]) && motions[g].length > 0);
+        if (groups.length === 0) return;
+
+        const matches = [];
+        for (const group of groups) {
+          const arr = motions[group] || [];
+          for (let i = 0; i < arr.length; i++) {
+            const file = String(arr[i]?.File || "");
+            if (filterFn(file, group, i)) matches.push({ group, index: i });
+          }
+        }
+        const pick = matches.length > 0 ? matches[Math.floor(Math.random() * matches.length)] : null;
+        if (!pick) { this.playMotion("idle"); return; }
+        try {
+          const ret = this.model.motion(pick.group, pick.index, 3);
+          if (ret && typeof ret.catch === "function") {
+            ret.catch((e) => console.warn("[Live2DMotionWarning][async]", e));
+          }
+        } catch (e) {
+          console.warn("[Live2DMotionWarning]", e);
+        }
+      },
+
+      // Compatibility wrapper
       setSpeaking(flag) {
-        this.speaking = !!flag;
+        window.setSpeaking(flag);
       },
 
       setFitLocked(flag, refit = true) {
         this._fitLocked = !!flag;
-        if (!this._fitLocked && refit) {
-          this._fitModelToView();
-        }
+        if (!this._fitLocked && refit) this._fitModelToView();
       },
 
       nudgeOffset(dx, dy) {
@@ -383,16 +947,58 @@
         }
       },
 
+      // ★ ticker:
+      //   1) 常规节拍: 仅处理位置起伏
+      //   2) 末级节拍: 强制覆盖嘴部参数，防止 motion/runtime 回写嘴型
       _bindTicker() {
         this.app.ticker.add((delta) => {
           if (!this.model) return;
           this._speakPhase += 0.1 * delta;
-          if (this.speaking) {
-            this.model.y = this._baseY + this._offsetY + Math.sin(this._speakPhase) * 3;
-          } else {
+
+          if (NO_MOTION_MODE) {
             this.model.y = this._baseY + this._offsetY;
+            return;
+          }
+
+          // 说话时身体微微上下起伏
+          if (this.speaking) {
+            this.model.y = this._baseY + this._offsetY
+                         + Math.sin(this._speakPhase * 1.2) * 2;
+          } else {
+            // 静止时也有轻微呼吸
+            this.model.y = this._baseY + this._offsetY
+                         + Math.sin(this._speakPhase * 0.5) * 1;
           }
         });
+
+        // Late override pass: run after most runtime updates.
+        const latePriority = (
+          PIXI.UPDATE_PRIORITY && Number.isFinite(PIXI.UPDATE_PRIORITY.UTILITY)
+        ) ? (PIXI.UPDATE_PRIORITY.UTILITY - 10) : -100;
+        this.app.ticker.add(() => {
+          if (!this.model) return;
+          const internal = this.model.internalModel;
+          const core = internal && internal.coreModel;
+          if (!core) return;
+
+          try {
+            internal.lipSync = false;
+            internal.lipSyncValue = 0;
+          } catch (_) {}
+
+          // Hard-force mouth at the end of frame to prevent periodic reopen/close.
+          _applyMouthNow();
+
+          const expr = this._currentExpression || 'neutral';
+          if (expr === 'shy') {
+            _trySet(core, 'ParamEyeLOpen', 0.0);
+            _trySet(core, 'ParamEyeROpen', 0.0);
+            _trySet(core, 'ParamEyeLSmile', 1.0);
+            _trySet(core, 'ParamEyeRSmile', 1.0);
+            _trySet(core, 'ParamEyeBallX', 0.0);
+            _trySet(core, 'ParamEyeBallY', 0.0);
+          }
+        }, null, latePriority);
       },
 
       _fitModelToView() {
@@ -401,7 +1007,6 @@
         const vh = window.innerHeight;
         if (!vw || !vh) return;
 
-        // Measure at unit scale, then fit to viewport.
         this.model.scale.set(1);
         const bounds = this.model.getLocalBounds();
         const mw = Math.max(1, bounds.width || 0);
@@ -423,25 +1028,19 @@
         const canvas = this.app?.view;
         if (!canvas) return;
 
-        canvas.addEventListener(
-          "wheel",
-          (ev) => {
-            if (!this.model) return;
-            ev.preventDefault();
-            const mouse = new PIXI.Point(ev.clientX, ev.clientY);
-            const localBefore = this.model.toLocal(mouse);
-            const delta = ev.deltaY < 0 ? 1.08 : 0.92;
-            this._userScale = Math.max(0.35, Math.min(this._userScale * delta, 3.0));
-            this._fitModelToView();
-
-            // Keep the point under cursor stable while zooming.
-            const globalAfter = this.model.toGlobal(localBefore);
-            this._offsetX += mouse.x - globalAfter.x;
-            this._offsetY += mouse.y - globalAfter.y;
-            this._fitModelToView();
-          },
-          { passive: false }
-        );
+        canvas.addEventListener("wheel", (ev) => {
+          if (!this.model) return;
+          ev.preventDefault();
+          const mouse = new PIXI.Point(ev.clientX, ev.clientY);
+          const localBefore = this.model.toLocal(mouse);
+          const delta = ev.deltaY < 0 ? 1.08 : 0.92;
+          this._userScale = Math.max(0.35, Math.min(this._userScale * delta, 3.0));
+          this._fitModelToView();
+          const globalAfter = this.model.toGlobal(localBefore);
+          this._offsetX += mouse.x - globalAfter.x;
+          this._offsetY += mouse.y - globalAfter.y;
+          this._fitModelToView();
+        }, { passive: false });
 
         canvas.addEventListener("pointerdown", (ev) => {
           if (ev.button !== 0) return;
@@ -456,6 +1055,8 @@
           this._dragLastY = ev.clientY;
           this._dragOriginX = this._offsetX;
           this._dragOriginY = this._offsetY;
+          this._pressClientX = ev.clientX;
+          this._pressClientY = ev.clientY;
           try { canvas.setPointerCapture(ev.pointerId); } catch (_) {}
         });
 
@@ -472,11 +1073,9 @@
             this._dragMoved = true;
           }
           if (this._dragMoved) {
-            // Apply a small deadzone to avoid jitter accumulating in moveDx/moveDy.
             if (Math.abs(stepDx) >= 0.5) this._dragWindowDx += stepDx;
             if (Math.abs(stepDy) >= 0.5) this._dragWindowDy += stepDy;
           }
-          // Drag now drives host-window movement; avoid local model drift.
         };
         canvas.addEventListener("pointermove", moveDrag);
         window.addEventListener("pointermove", moveDrag);
@@ -484,6 +1083,12 @@
         const stopDrag = (ev) => {
           if (!this._dragging) return;
           this._dragging = false;
+          const movedEnough =
+            Math.abs((ev.clientX || 0) - (this._pressClientX || 0)) > 4 ||
+            Math.abs((ev.clientY || 0) - (this._pressClientY || 0)) > 4;
+          if (!this._dragMoved && !movedEnough) {
+            this._handleClick(ev);
+          }
           this._dragMoved = false;
           this._lastDragMoveTs = 0;
           this._dragWindowDx = 0;
@@ -496,42 +1101,56 @@
         window.addEventListener("pointercancel", stopDrag);
       },
 
-      _keepModelVisibleDuringDrag() {
-        if (!this.model || !this._dragging) return;
-        const b = this.model.getBounds();
-        const vw = window.innerWidth || 0;
-        const vh = window.innerHeight || 0;
-        if (vw <= 1 || vh <= 1) return;
-
-        // Keep at least a small visible area in viewport during fast drag.
-        const minVisibleX = 90;
-        const minVisibleY = 120;
-        let ax = 0;
-        let ay = 0;
-
-        if (b.right < minVisibleX) {
-          ax = minVisibleX - b.right;
-        } else if (b.left > vw - minVisibleX) {
-          ax = (vw - minVisibleX) - b.left;
+      _handleClick(ev) {
+        if (!this.model) return;
+        const now = Date.now();
+        this._clickHistory = this._clickHistory.filter((t) => now - t < 900);
+        this._clickHistory.push(now);
+        if (this._clickHistory.length >= 4) {
+          this.setExpression("angry");
+          this._playMotionByFilter((file) => /special_0[1-3]|special/i.test(file));
+          this._clickHistory = [];
+          return;
         }
 
-        if (b.bottom < minVisibleY) {
-          ay = minVisibleY - b.bottom;
-        } else if (b.top > vh - minVisibleY) {
-          ay = (vh - minVisibleY) - b.top;
-        }
+        const mouse = new PIXI.Point(ev.clientX, ev.clientY);
+        const local = this.model.toLocal(mouse);
+        const hit = (name) => {
+          try {
+            if (typeof this.model.hitTest === "function") return this.model.hitTest(name, local.x, local.y);
+            const internal = this.model.internalModel;
+            if (internal && typeof internal.hitTest === "function") return internal.hitTest(name, local.x, local.y);
+          } catch (_) {}
+          return false;
+        };
 
-        if (Math.abs(ax) < 0.01 && Math.abs(ay) < 0.01) return;
-        this._offsetX += ax;
-        this._offsetY += ay;
-        // Keep current drag trajectory continuous after clamp.
-        this._dragOriginX += ax;
-        this._dragOriginY += ay;
-        this._fitModelToView();
-      }
+        const headNames = ["HitAreaHead", "Head", "head", "头"];
+        const bodyNames = ["HitAreaBody", "Body", "body", "身体"];
+        const faceNames = ["HitAreaFace", "Face", "face", "脸"];
+
+        if (headNames.some(hit)) {
+          this.setExpression("happy");
+          this._playMotionByFilter((file) => /special_0[1-3]|special/i.test(file));
+          return;
+        }
+        if (faceNames.some(hit)) {
+          this.setExpression("shy");
+          this._playMotionByFilter((file) => /mtn_0[2-4]|mtn/i.test(file));
+          return;
+        }
+        if (bodyNames.some(hit)) {
+          this.setExpression("surprised");
+          this._playMotionByFilter((file) => /mtn_0[2-4]|mtn/i.test(file));
+          return;
+        }
+        this.setExpression("happy");
+        this.playMotion("idle");
+      },
+
     };
 
     window.Live2DHost = Live2DHost;
   </script>
 </body>
 </html>
+

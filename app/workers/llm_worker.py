@@ -13,17 +13,23 @@ from app.core.pet_command import PetCommand
 
 
 SYSTEM_PROMPT = """你是一个控制 Live2D 桌宠的 Agent。
-你必须输出 JSON，格式如下：
+你必须只输出 JSON，格式如下：
 {
   "reply": "给用户的回复文本",
   "expression": "neutral|happy|sad|angry|surprised|shy",
-  "motion": "idle|wave|tap_body|flick_head|jump"
+  "motion": "idle|wave|tap_body|flick_head|jump",
+  "emotion_timeline": [
+    {"text": "分句1", "emotion": "happy"},
+    {"text": "分句2", "emotion": "sad"}
+  ]
 }
+
 规则：
-1. 仅输出 JSON，不要输出额外解释。
-2. expression 必须反映当前语气。
-3. motion 必须是给定枚举之一。
-4. reply 用中文简洁回答。
+1. 只输出 JSON，不要输出额外说明。
+2. reply 要简洁自然。
+3. expression 表示整体主情绪。
+4. emotion_timeline 必须按 reply 的内容顺序给出分句情绪；每个 text 应是 reply 的连续片段。
+5. emotion_timeline 至少 1 段，最多 6 段。
 """
 
 
@@ -33,6 +39,7 @@ class LLMWorker(QThread):
     error_occurred = pyqtSignal(str)
     status_changed = pyqtSignal(str)
     text_for_voice = pyqtSignal(str)
+    voice_payload_ready = pyqtSignal(dict)
     pet_command_ready = pyqtSignal(dict)
     new_session = pyqtSignal()
 
@@ -99,6 +106,7 @@ class LLMWorker(QThread):
             self.pet_command_ready.emit(cmd.to_dict())
             self.chunk_ready.emit(cmd.reply)
             self.text_for_voice.emit(cmd.reply)
+            self.voice_payload_ready.emit(cmd.to_voice_payload())
         except Exception as exc:
             self.error_occurred.emit(f"LLM 调用失败: {exc}")
         finally:

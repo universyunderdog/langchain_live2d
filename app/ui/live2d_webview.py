@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import time
 from pathlib import Path
 
 from PyQt5.QtCore import QUrl
@@ -29,9 +30,15 @@ class LoggingWebEnginePage(QWebEnginePage):
 
 
 class Live2DWebView(QWebEngineView):
-    def __init__(self, parent=None, model_url: str | None = None):
+    def __init__(
+        self,
+        parent=None,
+        model_url: str | None = None,
+        no_motion_mode: bool = False,
+    ):
         super().__init__(parent)
         self._model_url = model_url
+        self._no_motion_mode = bool(no_motion_mode)
         self.setPage(LoggingWebEnginePage(self))
         settings = self.settings()
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
@@ -39,10 +46,57 @@ class Live2DWebView(QWebEngineView):
         settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
         self.page().setBackgroundColor(QColor(0, 0, 0, 0))
         html_path = Path(__file__).resolve().parents[2] / "assets" / "web" / "index.html"
-        logger.info("Loading web page: %s", html_path)
-        self.load(QUrl.fromLocalFile(str(html_path)))
+        url = QUrl.fromLocalFile(str(html_path))
+        query = [f"v={int(time.time())}"]
+        if self._no_motion_mode:
+            query.append("no_motion=1")
+        url.setQuery("&".join(query))
+        logger.info("Loading web page: %s?%s", html_path, url.query())
+        self.load(url)
         self.loadFinished.connect(self._on_load_finished)
         self.loadProgress.connect(lambda p: logger.info("WebView load progress: %s%%", p))
+
+    def set_mouth_value(self, value: float):
+        """鐠佸墽鐤嗛崲鏉戝弽瀵姴绱戦崐?0.0~1.0"""
+        v = max(0.0, min(1.0, value))
+        self.page().runJavaScript(f"window.setMouthValue && window.setMouthValue({v:.3f});")
+
+    def set_mouth_shape(self, shape: str):
+        safe = (shape or "A").replace("\\", "\\\\").replace("'", "\\'")
+        self.page().runJavaScript(f"window.setMouthShape && window.setMouthShape('{safe}');")
+
+    def set_viseme_weights(self, weights: dict):
+        payload = json.dumps(weights or {}, ensure_ascii=False)
+        self.page().runJavaScript(f"window.setViseme && window.setViseme({payload});")
+
+    def set_mouth_immediate(self, value: float, weights: dict):
+        v = max(0.0, min(1.0, float(value)))
+        payload = json.dumps(weights or {}, ensure_ascii=False)
+        self.page().runJavaScript(
+            f"window.setMouthImmediate && window.setMouthImmediate({v:.3f}, {payload});"
+        )
+
+    def set_emotion(self, emotion: str):
+        safe = emotion.replace("'", "\\'").replace("\\", "\\\\")
+        self.page().runJavaScript(f"window.setEmotion && window.setEmotion('{safe}');")
+
+    def trigger_emphasis(self, strength: float = 0.7):
+        s = max(0.0, min(1.0, strength))
+        self.page().runJavaScript(f"window.triggerEmphasis && window.triggerEmphasis({s:.2f});")
+
+    def debug_speaking(self, callback=None):
+        """Debug current speaking state from web runtime."""
+
+        def _cb(result):
+            if callback:
+                callback(result)
+            else:
+                print("[DebugSpeaking]", result)
+
+        self.page().runJavaScript(
+            "window.debugSpeaking ? window.debugSpeaking() : 'not initialized'",
+            _cb
+        )
 
     def _on_load_finished(self, ok: bool):
         logger.info("WebView load finished: ok=%s", ok)
@@ -92,3 +146,6 @@ class Live2DWebView(QWebEngineView):
         )
         logger.debug("Run JS: %s args=%s", fn_expr, args)
         self.page().runJavaScript(js)
+
+
+
