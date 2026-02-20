@@ -1,6 +1,6 @@
 ﻿# LangChain Live2D Desktop Pet
 
-一个基于 `PyQt5 + Live2D + LangChain` 的桌面宠物项目，支持大模型对话、语音播报、口型同步与表情/动作联动。
+一个基于 `PyQt5 + Live2D + LangChain` 的桌面宠物项目，支持大模型对话、语音播报、口型同步、记忆存储与主动聊天。
 
 ## 功能概览
 
@@ -9,6 +9,7 @@
 - `edge-tts` 语音合成与播放
 - 口型同步（支持 viseme / Rhubarb）
 - 本地模型与在线模型资源加载
+- 对话记忆管理与主动聊天机制
 
 ## 快速开始
 
@@ -38,18 +39,25 @@ python main.py
 ## 目录结构
 
 - `main.py`: 应用入口
+- `app/core/memory.py`: 记忆管理逻辑
+- `app/core/proactive_chat.py`: 主动聊天策略
 - `app/ui/desktop_pet_window.py`: 桌宠窗口与交互逻辑
-- `app/ui/live2d_webview.py`: WebView 与 JS 桥接
+- `app/ui/chat_window.py`: 聊天窗口
+- `app/ui/action_menu.py`: 操作菜单 UI
+- `app/ui/speech_bubble.py`: 气泡消息 UI
 - `app/workers/llm_worker.py`: LLM 调用与结果处理
-- `app/workers/voice_worker.py`: TTS 与播放逻辑
 - `assets/web/index.html`: Live2D 前端渲染与控制
+- `memory/`: 记忆数据目录
 
-## 最近更新（2026-02-19）
+## 最近更新（2026-02-20）
 
-- 更新桌宠窗口交互与 WebView 联动逻辑
-- 调整 LLM worker 与语音 worker 的处理流程
-- 更新前端页面（`assets/web/index.html`）
-- 保持 `.env` 不纳入版本管理（通过 `.gitignore` 排除）
+- 新增记忆相关模块：`app/core/memory.py`
+- 新增主动聊天模块：`app/core/proactive_chat.py`
+- 新增 UI 组件：`app/ui/action_menu.py`、`app/ui/speech_bubble.py`
+- 更新聊天与主窗口逻辑：`app/ui/chat_window.py`、`app/ui/desktop_pet_window.py`
+- 更新 LLM 处理与前端页面：`app/workers/llm_worker.py`、`assets/web/index.html`
+- 新增记忆文件：`memory/2026-02-20.md`
+- `.env` 持续通过 `.gitignore` 排除，不纳入版本管理
 
 ## 注意事项
 

@@ -830,6 +830,9 @@
       _dragLastY: 0,
       _dragOriginX: 0,
       _dragOriginY: 0,
+      _dragPrevExpression: "neutral",
+      _dragEmotionApplied: false,
+      _dragPrevMouthState: null,
       _clickHistory: [],
       _currentExpression: "neutral",
       _eyeFollowEnabled: true,
@@ -980,6 +983,67 @@
         } catch (e) {
           console.warn("[Live2DMotionWarning]", e);
         }
+      },
+
+      _tryPlayCryMotion() {
+        if (!this.model) return false;
+        const motions = this.model.internalModel?.settings?.motions || {};
+        const groups = Object.keys(motions).filter(g => Array.isArray(motions[g]) && motions[g].length > 0);
+        if (groups.length === 0) return false;
+        const hasCry = groups.some((group) =>
+          (motions[group] || []).some((m) => /cry|weep|tear|sad|sob/i.test(String(m?.File || "")))
+        );
+        if (!hasCry) return false;
+        this._playMotionByFilter((file) => /cry|weep|tear|sad|sob/i.test(file));
+        return true;
+      },
+
+      _onDragEmotionStart() {
+        if (this._dragEmotionApplied) return;
+        this._dragPrevExpression = this._currentExpression || "neutral";
+        this._dragPrevMouthState = {
+          manualMouthMode: !!_anim.manualMouthMode,
+          visemeWeights: _anim.visemeWeights ? { ..._anim.visemeWeights } : null,
+          visemeActiveUntil: Number(_anim.visemeActiveUntil || 0),
+          mouthValue: Number(_anim.mouthValue || 0),
+          smoothedMouth: Number(_anim.smoothedMouth || 0),
+          mouthShape: String(_anim.mouthShape || "A"),
+        };
+        this.setExpression("angry");
+        this._tryPlayCryMotion();
+        _anim.manualMouthMode = true;
+        _anim.visemeWeights = { A: 0, I: 1, U: 0, E: 0, O: 0 };
+        _anim.visemeActiveUntil = Number.POSITIVE_INFINITY;
+        _anim.mouthValue = 1;
+        _anim.smoothedMouth = 1;
+        _anim.mouthShape = "I";
+        _applyMouthNow();
+        this._dragEmotionApplied = true;
+      },
+
+      _onDragEmotionEnd() {
+        if (!this._dragEmotionApplied) return;
+        const back = this._dragPrevExpression || "neutral";
+        this.setExpression(back);
+        const prev = this._dragPrevMouthState || null;
+        if (prev) {
+          _anim.manualMouthMode = !!prev.manualMouthMode;
+          _anim.visemeWeights = prev.visemeWeights ? { ...prev.visemeWeights } : null;
+          _anim.visemeActiveUntil = Number(prev.visemeActiveUntil || 0);
+          _anim.mouthValue = Number(prev.mouthValue || 0);
+          _anim.smoothedMouth = Number(prev.smoothedMouth || 0);
+          _anim.mouthShape = String(prev.mouthShape || "A");
+        } else {
+          _anim.manualMouthMode = false;
+          _anim.visemeWeights = null;
+          _anim.visemeActiveUntil = 0;
+          _anim.mouthValue = 0;
+          _anim.smoothedMouth = 0;
+          _anim.mouthShape = "A";
+        }
+        _applyMouthNow();
+        this._dragPrevMouthState = null;
+        this._dragEmotionApplied = false;
       },
 
       // Compatibility wrapper
@@ -1201,6 +1265,7 @@
           this._lastDragMoveTs = Date.now();
           if (!this._dragMoved && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) {
             this._dragMoved = true;
+            this._onDragEmotionStart();
           }
           if (this._dragMoved) {
             if (Math.abs(stepDx) >= 0.5) this._dragWindowDx += stepDx;
@@ -1219,6 +1284,7 @@
           if (!this._dragMoved && !movedEnough) {
             this._handleClick(ev);
           }
+          this._onDragEmotionEnd();
           this._dragMoved = false;
           this._lastDragMoveTs = 0;
           this._dragWindowDx = 0;
